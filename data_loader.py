@@ -2,6 +2,7 @@ import pandas as pd
 import torch
 from torch.utils.data import Dataset, DataLoader
 from pathlib import Path
+from collections import OrderedDict
 
 
 class StockHeadlineDataset(Dataset):
@@ -13,6 +14,7 @@ class StockHeadlineDataset(Dataset):
         lookback_days: int = 14,
         future_days: int = 1,
         price_movement_threshold: float = 0.005,
+        cache_size: int = 50,
         device=None,
     ):
         """
@@ -25,6 +27,7 @@ class StockHeadlineDataset(Dataset):
             lookback_days (int): Number of days to look back for stock features
             future_days (int): Number of days to look forward for price change calculation
             price_movement_threshold (float): Threshold for determining price movement direction
+            cache_size (int): Maximum number of stock dataframes to keep in memory
             device: Device to place tensors on ('cuda' or 'cpu')
         """
         # Load headline data
@@ -36,6 +39,17 @@ class StockHeadlineDataset(Dataset):
         self.lookback_days = lookback_days
         self.future_days = future_days
         self.price_movement_threshold = price_movement_threshold
+        
+        # Create a cache for stock data with limited size
+        self.cache_size = cache_size
+        self.stock_data_cache = OrderedDict()
+        
+        # Create a mapping of available stock tickers
+        self.available_tickers = set()
+        for stock_file in self.stock_data_dir.glob("*.csv"):
+            self.available_tickers.add(stock_file.stem)
+        
+        print(f"Found {len(self.available_tickers)} stock tickers in directory")
 
         # Set device for tensor placement
         self.device = (
@@ -45,23 +59,37 @@ class StockHeadlineDataset(Dataset):
         )
         print(f"Using device: {self.device}")
 
-        # Pre-load all stock data files
-        self.stock_data = {}
-        for stock_file in self.stock_data_dir.glob("*.csv"):
-            ticker = stock_file.stem
-            try:
-                data = pd.read_csv(stock_file)
-                data["Date"] = pd.to_datetime(data["Date"])
-                data = data.sort_values("Date")
-                self.stock_data[ticker] = data
-            except Exception as e:
-                print(f"Error loading {stock_file}: {e}")
-
-        print(f"Loaded stock data for {len(self.stock_data)} tickers")
-
         # Find valid samples
         self.valid_samples = []
         self._find_valid_samples()
+
+    def _load_stock_data(self, ticker: str) -> pd.DataFrame:
+        """Load stock data for a specific ticker with LRU caching"""
+        # Return from cache if available
+        if ticker in self.stock_data_cache:
+            # Move to the end (most recently used)
+            data = self.stock_data_cache.pop(ticker)
+            self.stock_data_cache[ticker] = data
+            return data
+            
+        # Load from file
+        try:
+            stock_file = self.stock_data_dir / f"{ticker}.csv"
+            data = pd.read_csv(stock_file)
+            data["Date"] = pd.to_datetime(data["Date"])
+            data = data.sort_values("Date")
+            
+            # Add to cache
+            self.stock_data_cache[ticker] = data
+            
+            # Remove oldest item if cache is full
+            if len(self.stock_data_cache) > self.cache_size:
+                self.stock_data_cache.popitem(last=False)
+                
+            return data
+        except Exception as e:
+            print(f"Error loading {ticker}.csv: {e}")
+            return None
 
     def _find_valid_samples(self):
         """Find headlines with corresponding valid stock data for analysis"""
@@ -72,43 +100,58 @@ class StockHeadlineDataset(Dataset):
         insufficient_history = 0
         insufficient_future = 0
 
+        # Group headlines by ticker to minimize file loading during validation
+        headlines_by_ticker = {}
         for idx, row in self.headlines.iterrows():
             ticker = row["Stock_symbol"]
-            headline_date: pd.Timestamp = pd.to_datetime(row["Date"])
+            if ticker not in headlines_by_ticker:
+                headlines_by_ticker[ticker] = []
+            headlines_by_ticker[ticker].append((idx, row))
 
-            # Skip if we don't have data for this ticker
-            if ticker not in self.stock_data:
-                missing_tickers += 1
+        for ticker, headline_entries in headlines_by_ticker.items():
+            # Skip if we don't have this ticker's data file
+            if ticker not in self.available_tickers:
+                missing_tickers += len(headline_entries)
                 continue
-
-            stock_df: pd.DataFrame = self.stock_data[ticker]
-
-            # Find the exact trading date matching the headline date
-            headline_date_only = headline_date.date()
-            mask = stock_df["Date"].dt.date == headline_date_only
-            relevant_dates = stock_df[mask]["Date"]
-            if relevant_dates.empty:
-                missing_date_data += 1
+                
+            # Load this ticker's data once for validating all its headlines
+            stock_df = self._load_stock_data(ticker)
+            if stock_df is None:
+                missing_tickers += len(headline_entries)
                 continue
+                
+            for idx, row in headline_entries:
+                headline_date = pd.to_datetime(row["Date"])
+                
+                # Find the exact trading date matching the headline date
+                headline_date_only = headline_date.date()
+                mask = stock_df["Date"].dt.date == headline_date_only
+                relevant_dates = stock_df[mask]["Date"]
+                if relevant_dates.empty:
+                    missing_date_data += 1
+                    continue
 
-            headline_trading_date = relevant_dates.iloc[0]
-            headline_idx = stock_df[stock_df["Date"] == headline_trading_date].index[0]
+                headline_trading_date = relevant_dates.iloc[0]
+                headline_idx = stock_df[stock_df["Date"] == headline_trading_date].index[0]
 
-            # Check if we have enough historical data (lookback days)
-            if headline_idx < self.lookback_days:
-                insufficient_history += 1
-                continue
+                # Check if we have enough historical data (lookback days)
+                if headline_idx < self.lookback_days:
+                    insufficient_history += 1
+                    continue
 
-            # Check if we have enough future data (future days)
-            future_dates = stock_df[stock_df["Date"] > headline_trading_date]
-            if len(future_dates) < self.future_days:
-                insufficient_future += 1
-                continue
+                # Check if we have enough future data (future days)
+                future_dates = stock_df[stock_df["Date"] > headline_trading_date]
+                if len(future_dates) < self.future_days:
+                    insufficient_future += 1
+                    continue
 
-            future_day_idx = future_dates.index[self.future_days - 1]
+                future_day_idx = future_dates.index[self.future_days - 1]
 
-            # Store valid sample: headline index, current day index, future day index
-            self.valid_samples.append((idx, headline_idx, future_day_idx))
+                # Store valid sample: headline index, ticker, current day index, future day index
+                self.valid_samples.append((idx, ticker, headline_idx, future_day_idx))
+
+        # Clear cache after validation to free memory
+        self.stock_data_cache.clear()
 
         # Print debugging information
         print(f"Missing tickers: {missing_tickers}")
@@ -123,15 +166,14 @@ class StockHeadlineDataset(Dataset):
 
     def __getitem__(self, idx: int):
         """Get a data sample: historical prices, headline, and label"""
-        headline_idx, current_idx, future_day_idx = self.valid_samples[idx]
+        headline_idx, ticker, current_idx, future_day_idx = self.valid_samples[idx]
 
         # Get headline information
         headline_row = self.headlines.iloc[headline_idx]
-        ticker: str = headline_row["Stock_symbol"]
         headline_text: str = headline_row["Article_title"]
 
-        # Get stock data
-        stock_df: pd.DataFrame = self.stock_data[ticker]
+        # Load stock data on demand
+        stock_df = self._load_stock_data(ticker)
 
         # Get historical data (lookback period)
         historical_data = stock_df.iloc[
@@ -177,6 +219,7 @@ def create_stock_data_loader(
     lookback_days: int = 14,
     future_days: int = 1,
     price_movement_threshold: float = 0.005,
+    cache_size: int = 50,
     device=None,
 ) -> DataLoader:
     """
@@ -192,6 +235,7 @@ def create_stock_data_loader(
         lookback_days (int): Number of days to look back for stock features
         future_days (int): Number of days to look forward for price change calculation
         price_movement_threshold (float): Threshold for determining price movement direction
+        cache_size (int): Maximum number of stock dataframes to keep in memory
         device: Device to place tensors on ('cuda' or 'cpu')
 
     Returns:
@@ -204,6 +248,7 @@ def create_stock_data_loader(
         lookback_days=lookback_days,
         future_days=future_days,
         price_movement_threshold=price_movement_threshold,
+        cache_size=cache_size,
         device=device,
     )
 
@@ -256,11 +301,12 @@ if __name__ == "__main__":
         loader = create_stock_data_loader(
             headline_file=headline_file,
             stock_data_dir=stock_data_dir,
-            n_samples=10000,  # Use None for all samples
+            n_samples=None,  # Use None for all samples
             batch_size=16,
             lookback_days=14,
             future_days=1,
             price_movement_threshold=0.005,
+            cache_size=50,  # Keep n most recent stock dataframes in memory
             device="cuda" if torch.cuda.is_available() else "cpu",
         )
 
