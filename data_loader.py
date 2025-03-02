@@ -15,8 +15,9 @@ class StockHeadlineDataset(Dataset):
         future_days: int = 1,
         price_movement_threshold: float = 0.005,
         cache_size: int = 50,
-        chunk_size: int = 10000,  # Default chunk size, None means load all at once
+        chunk_size: int = 10000,
         device=None,
+        verbose: bool = False,
     ):
         """
         Dataset for stock headlines and corresponding stock data
@@ -29,17 +30,19 @@ class StockHeadlineDataset(Dataset):
             future_days (int): Number of days to look forward for price change calculation
             price_movement_threshold (float): Threshold for determining price movement direction
             cache_size (int): Maximum number of stock dataframes to keep in memory
-            chunk_size (int): Number of headlines to process at once
+            chunk_size (int): Number of headlines to process at once. If None, process all at once.
             device: Device to place tensors on ('cuda' or 'cpu')
+            verbose (bool): Whether to print detailed progress information
         """
         # Store parameters but don't load all headlines at once
         self.headline_file = headline_file
         self.stock_data_dir = Path(stock_data_dir)
         self.n_samples = n_samples
         self.chunk_size = chunk_size
+        self.verbose = verbose
 
         # Get the total number of rows in the headline file
-        with open(headline_file, "r") as f:
+        with open(headline_file, "rb") as f:
             self.total_rows = sum(1 for _ in f) - 1  # Subtract 1 for header
 
         if n_samples is not None:
@@ -58,7 +61,8 @@ class StockHeadlineDataset(Dataset):
         for stock_file in self.stock_data_dir.glob("*.csv"):
             self.available_tickers.add(stock_file.stem)
 
-        print(f"Found {len(self.available_tickers)} stock tickers in directory")
+        if self.verbose:
+            print(f"Found {len(self.available_tickers)} stock tickers in directory")
 
         # Set device for tensor placement
         self.device = (
@@ -66,7 +70,8 @@ class StockHeadlineDataset(Dataset):
             if device is not None
             else ("cuda" if torch.cuda.is_available() else "cpu")
         )
-        print(f"Using device: {self.device}")
+        if self.verbose:
+            print(f"Using device: {self.device}")
 
         # Store headline data only for valid samples
         self.headline_data = {}  # Dictionary to store headline data for valid samples
@@ -103,7 +108,8 @@ class StockHeadlineDataset(Dataset):
 
     def _find_valid_samples(self):
         """Find headlines with corresponding valid stock data for analysis"""
-        print(f"Starting validation of up to {self.total_rows} headlines")
+        if self.verbose:
+            print(f"Starting validation of up to {self.total_rows} headlines")
 
         missing_tickers = 0
         missing_date_data = 0
@@ -114,17 +120,20 @@ class StockHeadlineDataset(Dataset):
         # Determine how to read the CSV file
         if self.chunk_size is None:
             if self.n_samples is not None:
-                print(f"Loading first {self.n_samples} headlines at once")
+                if self.verbose:
+                    print(f"Loading first {self.n_samples} headlines at once")
                 chunks = pd.read_csv(self.headline_file, nrows=self.n_samples)
             else:
-                print("Loading entire headline file at once")
+                if self.verbose:
+                    print("Loading entire headline file at once")
                 chunks = pd.read_csv(self.headline_file)
 
             # Convert a single DataFrame into a list with one item for consistent processing
             chunks = [chunks]
         else:
             # Process the headline file in chunks to reduce memory usage
-            print(f"Processing headline file in chunks of size {self.chunk_size}")
+            if self.verbose:
+                print(f"Processing headline file in chunks of size {self.chunk_size}")
             chunks = pd.read_csv(self.headline_file, chunksize=self.chunk_size)
 
         for chunk_num, chunk in enumerate(chunks):
@@ -142,9 +151,10 @@ class StockHeadlineDataset(Dataset):
                 if remaining < len(chunk):
                     chunk = chunk.iloc[:remaining]
 
-            # print(
-            #     f"Processing chunk {chunk_num + 1}, headlines {total_processed + 1}-{total_processed + len(chunk)}"
-            # )
+            if self.verbose:
+                print(
+                    f"Processing chunk {chunk_num + 1}, headlines {total_processed + 1}-{total_processed + len(chunk)}"
+                )
 
             # Group headlines by ticker to minimize file loading during validation
             headlines_by_ticker = {}
@@ -210,18 +220,20 @@ class StockHeadlineDataset(Dataset):
 
             # Early termination if we've found enough samples
             if self.n_samples is not None and len(self.valid_samples) >= self.n_samples:
-                print(f"Reached requested sample count: {self.n_samples}")
+                if self.verbose:
+                    print(f"Reached requested sample count: {self.n_samples}")
                 break
 
         # Clear cache after validation to free memory
         self.stock_data_cache.clear()
 
         # Print debugging information
-        print(f"Missing tickers: {missing_tickers}")
-        print(f"Missing date data: {missing_date_data}")
-        print(f"Insufficient history: {insufficient_history}")
-        print(f"Insufficient future data: {insufficient_future}")
-        print(f"Valid samples found: {len(self.valid_samples)}")
+        if self.verbose:
+            print(f"Missing tickers: {missing_tickers}")
+            print(f"Missing date data: {missing_date_data}")
+            print(f"Insufficient history: {insufficient_history}")
+            print(f"Insufficient future data: {insufficient_future}")
+            print(f"Valid samples found: {len(self.valid_samples)}")
 
     def __len__(self):
         """Return the number of valid samples"""
@@ -283,8 +295,9 @@ def create_stock_data_loader(
     future_days: int = 1,
     price_movement_threshold: float = 0.005,
     cache_size: int = 50,
-    chunk_size: int = 10000,  # None means load all at once
+    chunk_size: int = 10000,
     device=None,
+    verbose: bool = False,
 ) -> DataLoader:
     """
     Creates a DataLoader for stock headline data
@@ -302,6 +315,7 @@ def create_stock_data_loader(
         cache_size (int): Maximum number of stock dataframes to keep in memory
         chunk_size (int): Number of headlines to process at once
         device: Device to place tensors on ('cuda' or 'cpu')
+        verbose (bool): Whether to print detailed progress information
 
     Returns:
         DataLoader: A PyTorch DataLoader for the stock headline dataset
@@ -316,12 +330,14 @@ def create_stock_data_loader(
         cache_size=cache_size,
         chunk_size=chunk_size,
         device=device,
+        verbose=verbose,  # Pass verbose parameter to dataset
     )
 
     valid_samples = len(dataset)
-    print(
-        f"Found {valid_samples} valid samples out of approximately {dataset.total_rows} headlines"
-    )
+    if verbose:
+        print(
+            f"Found {valid_samples} valid samples out of approximately {dataset.total_rows} headlines"
+        )
 
     # Handle case with zero valid samples
     if valid_samples == 0:
@@ -332,7 +348,7 @@ def create_stock_data_loader(
 
     # Adjust batch size if needed to ensure it's not larger than dataset
     actual_batch_size = min(batch_size, valid_samples)
-    if actual_batch_size != batch_size:
+    if actual_batch_size != batch_size and verbose:
         print(
             f"Adjusted batch size from {batch_size} to {actual_batch_size} due to dataset size"
         )
@@ -375,6 +391,7 @@ if __name__ == "__main__":
             cache_size=50,  # Keep n most recent stock dataframes in memory
             chunk_size=10000,  # Use None for all headlines
             device="cuda" if torch.cuda.is_available() else "cpu",
+            verbose=True,
         )
 
         # Display one batch
