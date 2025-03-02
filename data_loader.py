@@ -12,6 +12,7 @@ class StockHeadlineDataset(Dataset):
         n_samples: int = None,
         lookback_days: int = 14,
         future_days: int = 1,
+        price_movement_threshold: float = 0.005,
         device=None,
     ):
         """
@@ -23,6 +24,7 @@ class StockHeadlineDataset(Dataset):
             n_samples (int, optional): Number of headline samples to use. If None, use all.
             lookback_days (int): Number of days to look back for stock features
             future_days (int): Number of days to look forward for price change calculation
+            price_movement_threshold (float): Threshold for determining price movement direction
             device: Device to place tensors on ('cuda' or 'cpu')
         """
         # Load headline data
@@ -33,6 +35,7 @@ class StockHeadlineDataset(Dataset):
 
         self.lookback_days = lookback_days
         self.future_days = future_days
+        self.price_movement_threshold = price_movement_threshold
 
         # Set device for tensor placement
         self.device = (
@@ -145,13 +148,13 @@ class StockHeadlineDataset(Dataset):
 
         price_change_ratio = (future_close - current_close) / current_close
 
-        # Assign label based on price movement rules
-        if price_change_ratio > 0.005:
-            label = 1  # Increase
-        elif price_change_ratio < -0.005:
-            label = -1  # Decrease
+        # Assign label based on price movement rules using the threshold parameter
+        if price_change_ratio > self.price_movement_threshold:
+            label = 2  # Increase
+        elif price_change_ratio < -self.price_movement_threshold:
+            label = 0  # Decrease
         else:
-            label = 0  # Stayed the same
+            label = 1  # Stayed the same
 
         return {
             "headline": headline_text,
@@ -173,6 +176,7 @@ def create_stock_data_loader(
     num_workers: int = 4,
     lookback_days: int = 14,
     future_days: int = 1,
+    price_movement_threshold: float = 0.005,
     device=None,
 ) -> DataLoader:
     """
@@ -187,6 +191,7 @@ def create_stock_data_loader(
         num_workers (int): Number of workers for the DataLoader
         lookback_days (int): Number of days to look back for stock features
         future_days (int): Number of days to look forward for price change calculation
+        price_movement_threshold (float): Threshold for determining price movement direction
         device: Device to place tensors on ('cuda' or 'cpu')
 
     Returns:
@@ -198,6 +203,7 @@ def create_stock_data_loader(
         n_samples=n_samples,
         lookback_days=lookback_days,
         future_days=future_days,
+        price_movement_threshold=price_movement_threshold,
         device=device,
     )
 
@@ -254,6 +260,7 @@ if __name__ == "__main__":
             batch_size=16,
             lookback_days=14,
             future_days=1,
+            price_movement_threshold=0.005,
             device="cuda" if torch.cuda.is_available() else "cpu",
         )
 
