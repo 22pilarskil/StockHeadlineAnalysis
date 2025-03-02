@@ -15,6 +15,7 @@ class StockHeadlineDataset(Dataset):
         future_days: int = 1,
         price_movement_threshold: float = 0.005,
         cache_size: int = 50,
+        chunk_size: int = 10000,  # Default chunk size, None means load all at once
         device=None,
     ):
         """
@@ -28,27 +29,35 @@ class StockHeadlineDataset(Dataset):
             future_days (int): Number of days to look forward for price change calculation
             price_movement_threshold (float): Threshold for determining price movement direction
             cache_size (int): Maximum number of stock dataframes to keep in memory
+            chunk_size (int): Number of headlines to process at once
             device: Device to place tensors on ('cuda' or 'cpu')
         """
-        # Load headline data
+        # Store parameters but don't load all headlines at once
+        self.headline_file = headline_file
         self.stock_data_dir = Path(stock_data_dir)
-        self.headlines = pd.read_csv(headline_file)
+        self.n_samples = n_samples
+        self.chunk_size = chunk_size
+
+        # Get the total number of rows in the headline file
+        with open(headline_file, "r") as f:
+            self.total_rows = sum(1 for _ in f) - 1  # Subtract 1 for header
+
         if n_samples is not None:
-            self.headlines = self.headlines.head(n_samples)
+            self.total_rows = min(self.total_rows, n_samples)
 
         self.lookback_days = lookback_days
         self.future_days = future_days
         self.price_movement_threshold = price_movement_threshold
-        
+
         # Create a cache for stock data with limited size
         self.cache_size = cache_size
         self.stock_data_cache = OrderedDict()
-        
+
         # Create a mapping of available stock tickers
         self.available_tickers = set()
         for stock_file in self.stock_data_dir.glob("*.csv"):
             self.available_tickers.add(stock_file.stem)
-        
+
         print(f"Found {len(self.available_tickers)} stock tickers in directory")
 
         # Set device for tensor placement
@@ -59,7 +68,8 @@ class StockHeadlineDataset(Dataset):
         )
         print(f"Using device: {self.device}")
 
-        # Find valid samples
+        # Store headline data only for valid samples
+        self.headline_data = {}  # Dictionary to store headline data for valid samples
         self.valid_samples = []
         self._find_valid_samples()
 
@@ -71,21 +81,21 @@ class StockHeadlineDataset(Dataset):
             data = self.stock_data_cache.pop(ticker)
             self.stock_data_cache[ticker] = data
             return data
-            
+
         # Load from file
         try:
             stock_file = self.stock_data_dir / f"{ticker}.csv"
             data = pd.read_csv(stock_file)
             data["Date"] = pd.to_datetime(data["Date"])
             data = data.sort_values("Date")
-            
+
             # Add to cache
             self.stock_data_cache[ticker] = data
-            
+
             # Remove oldest item if cache is full
             if len(self.stock_data_cache) > self.cache_size:
                 self.stock_data_cache.popitem(last=False)
-                
+
             return data
         except Exception as e:
             print(f"Error loading {ticker}.csv: {e}")
@@ -93,62 +103,115 @@ class StockHeadlineDataset(Dataset):
 
     def _find_valid_samples(self):
         """Find headlines with corresponding valid stock data for analysis"""
-        print(f"Starting with {len(self.headlines)} headlines to analyze")
+        print(f"Starting validation of up to {self.total_rows} headlines")
 
         missing_tickers = 0
         missing_date_data = 0
         insufficient_history = 0
         insufficient_future = 0
+        total_processed = 0
 
-        # Group headlines by ticker to minimize file loading during validation
-        headlines_by_ticker = {}
-        for idx, row in self.headlines.iterrows():
-            ticker = row["Stock_symbol"]
-            if ticker not in headlines_by_ticker:
-                headlines_by_ticker[ticker] = []
-            headlines_by_ticker[ticker].append((idx, row))
+        # Determine how to read the CSV file
+        if self.chunk_size is None:
+            if self.n_samples is not None:
+                print(f"Loading first {self.n_samples} headlines at once")
+                chunks = pd.read_csv(self.headline_file, nrows=self.n_samples)
+            else:
+                print("Loading entire headline file at once")
+                chunks = pd.read_csv(self.headline_file)
 
-        for ticker, headline_entries in headlines_by_ticker.items():
-            # Skip if we don't have this ticker's data file
-            if ticker not in self.available_tickers:
-                missing_tickers += len(headline_entries)
-                continue
-                
-            # Load this ticker's data once for validating all its headlines
-            stock_df = self._load_stock_data(ticker)
-            if stock_df is None:
-                missing_tickers += len(headline_entries)
-                continue
-                
-            for idx, row in headline_entries:
-                headline_date = pd.to_datetime(row["Date"])
-                
-                # Find the exact trading date matching the headline date
-                headline_date_only = headline_date.date()
-                mask = stock_df["Date"].dt.date == headline_date_only
-                relevant_dates = stock_df[mask]["Date"]
-                if relevant_dates.empty:
-                    missing_date_data += 1
+            # Convert a single DataFrame into a list with one item for consistent processing
+            chunks = [chunks]
+        else:
+            # Process the headline file in chunks to reduce memory usage
+            print(f"Processing headline file in chunks of size {self.chunk_size}")
+            chunks = pd.read_csv(self.headline_file, chunksize=self.chunk_size)
+
+        for chunk_num, chunk in enumerate(chunks):
+            # Terminate if we've processed enough samples when using chunks
+            if (
+                self.chunk_size is not None
+                and self.n_samples is not None
+                and total_processed >= self.n_samples
+            ):
+                break
+
+            # Trim chunk if needed to respect n_samples limit
+            if self.n_samples is not None and self.chunk_size is not None:
+                remaining = self.n_samples - total_processed
+                if remaining < len(chunk):
+                    chunk = chunk.iloc[:remaining]
+
+            # print(
+            #     f"Processing chunk {chunk_num + 1}, headlines {total_processed + 1}-{total_processed + len(chunk)}"
+            # )
+
+            # Group headlines by ticker to minimize file loading during validation
+            headlines_by_ticker = {}
+            for idx, row in chunk.iterrows():
+                ticker = row["Stock_symbol"]
+                if ticker not in headlines_by_ticker:
+                    headlines_by_ticker[ticker] = []
+                headlines_by_ticker[ticker].append((idx, row))
+
+            # Process each ticker group
+            for ticker, headline_entries in headlines_by_ticker.items():
+                # Skip if we don't have this ticker's data file
+                if ticker not in self.available_tickers:
+                    missing_tickers += len(headline_entries)
                     continue
 
-                headline_trading_date = relevant_dates.iloc[0]
-                headline_idx = stock_df[stock_df["Date"] == headline_trading_date].index[0]
-
-                # Check if we have enough historical data (lookback days)
-                if headline_idx < self.lookback_days:
-                    insufficient_history += 1
+                # Load this ticker's data once for validating all its headlines
+                stock_df = self._load_stock_data(ticker)
+                if stock_df is None:
+                    missing_tickers += len(headline_entries)
                     continue
 
-                # Check if we have enough future data (future days)
-                future_dates = stock_df[stock_df["Date"] > headline_trading_date]
-                if len(future_dates) < self.future_days:
-                    insufficient_future += 1
-                    continue
+                for idx, row in headline_entries:
+                    headline_date = pd.to_datetime(row["Date"])
 
-                future_day_idx = future_dates.index[self.future_days - 1]
+                    # Find the exact trading date matching the headline date
+                    headline_date_only = headline_date.date()
+                    mask = stock_df["Date"].dt.date == headline_date_only
+                    relevant_dates = stock_df[mask]["Date"]
+                    if relevant_dates.empty:
+                        missing_date_data += 1
+                        continue
 
-                # Store valid sample: headline index, ticker, current day index, future day index
-                self.valid_samples.append((idx, ticker, headline_idx, future_day_idx))
+                    headline_trading_date = relevant_dates.iloc[0]
+                    headline_idx = stock_df[
+                        stock_df["Date"] == headline_trading_date
+                    ].index[0]
+
+                    # Check if we have enough historical data (lookback days)
+                    if headline_idx < self.lookback_days:
+                        insufficient_history += 1
+                        continue
+
+                    # Check if we have enough future data (future days)
+                    future_dates = stock_df[stock_df["Date"] > headline_trading_date]
+                    if len(future_dates) < self.future_days:
+                        insufficient_future += 1
+                        continue
+
+                    future_day_idx = future_dates.index[self.future_days - 1]
+
+                    # Store only the valid headline data and sample info
+                    self.headline_data[idx] = row
+                    self.valid_samples.append(
+                        (idx, ticker, headline_idx, future_day_idx)
+                    )
+
+            total_processed += len(chunk)
+
+            # Break after the single chunk if we loaded all at once
+            if self.chunk_size is None:
+                break
+
+            # Early termination if we've found enough samples
+            if self.n_samples is not None and len(self.valid_samples) >= self.n_samples:
+                print(f"Reached requested sample count: {self.n_samples}")
+                break
 
         # Clear cache after validation to free memory
         self.stock_data_cache.clear()
@@ -168,8 +231,8 @@ class StockHeadlineDataset(Dataset):
         """Get a data sample: historical prices, headline, and label"""
         headline_idx, ticker, current_idx, future_day_idx = self.valid_samples[idx]
 
-        # Get headline information
-        headline_row = self.headlines.iloc[headline_idx]
+        # Get headline information from stored valid headline data
+        headline_row = self.headline_data[headline_idx]
         headline_text: str = headline_row["Article_title"]
 
         # Load stock data on demand
@@ -220,6 +283,7 @@ def create_stock_data_loader(
     future_days: int = 1,
     price_movement_threshold: float = 0.005,
     cache_size: int = 50,
+    chunk_size: int = 10000,  # None means load all at once
     device=None,
 ) -> DataLoader:
     """
@@ -228,7 +292,7 @@ def create_stock_data_loader(
     Args:
         headline_file (str): Path to the headline CSV file
         stock_data_dir (str): Directory containing stock CSV files
-        n_samples (int, optional): Number of samples to use
+        n_samples (int, optional): Number of headline samples to use. If None, use all.
         batch_size (int): Batch size for the DataLoader
         shuffle (bool): Whether to shuffle the data
         num_workers (int): Number of workers for the DataLoader
@@ -236,6 +300,7 @@ def create_stock_data_loader(
         future_days (int): Number of days to look forward for price change calculation
         price_movement_threshold (float): Threshold for determining price movement direction
         cache_size (int): Maximum number of stock dataframes to keep in memory
+        chunk_size (int): Number of headlines to process at once
         device: Device to place tensors on ('cuda' or 'cpu')
 
     Returns:
@@ -249,12 +314,13 @@ def create_stock_data_loader(
         future_days=future_days,
         price_movement_threshold=price_movement_threshold,
         cache_size=cache_size,
+        chunk_size=chunk_size,
         device=device,
     )
 
     valid_samples = len(dataset)
     print(
-        f"Found {valid_samples} valid samples out of {len(dataset.headlines)} headlines"
+        f"Found {valid_samples} valid samples out of approximately {dataset.total_rows} headlines"
     )
 
     # Handle case with zero valid samples
@@ -301,12 +367,13 @@ if __name__ == "__main__":
         loader = create_stock_data_loader(
             headline_file=headline_file,
             stock_data_dir=stock_data_dir,
-            n_samples=None,  # Use None for all samples
+            n_samples=None,  # Use None for all headlines
             batch_size=16,
             lookback_days=14,
             future_days=1,
             price_movement_threshold=0.005,
             cache_size=50,  # Keep n most recent stock dataframes in memory
+            chunk_size=10000,  # Use None for all headlines
             device="cuda" if torch.cuda.is_available() else "cpu",
         )
 
