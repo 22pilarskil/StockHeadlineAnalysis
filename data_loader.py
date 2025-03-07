@@ -59,7 +59,7 @@ class StockHeadlineDataset(Dataset):
         # Create a mapping of available stock tickers
         self.available_tickers = set()
         for stock_file in self.stock_data_dir.glob("*.csv"):
-            self.available_tickers.add(stock_file.stem)
+            self.available_tickers.add(stock_file.stem.split('_')[0])
 
         if self.verbose:
             print(f"Found {len(self.available_tickers)} stock tickers in directory")
@@ -89,7 +89,7 @@ class StockHeadlineDataset(Dataset):
 
         # Load from file
         try:
-            stock_file = self.stock_data_dir / f"{ticker}.csv"
+            stock_file = self.stock_data_dir / f"{ticker}_numerical_features_processed.csv"
             data = pd.read_csv(stock_file)
             data["Date"] = pd.to_datetime(data["Date"])
             data = data.sort_values("Date")
@@ -256,12 +256,12 @@ class StockHeadlineDataset(Dataset):
         ]
 
         # Extract features for the lookback period
-        features = historical_data[["Open", "High", "Low", "Close", "Volume"]].values
+        features = historical_data.drop(columns=["Date"]).values
         features_tensor = torch.tensor(features, dtype=torch.float32).to(self.device)
 
         # Calculate price change for labeling
-        current_close = stock_df.iloc[current_idx]["Close"]
-        future_close = stock_df.iloc[future_day_idx]["Close"]
+        current_close = stock_df.iloc[current_idx]["Log Adjusted Close"]
+        future_close = stock_df.iloc[future_day_idx]["Log Adjusted Close"]
 
         price_change_ratio = (future_close - current_close) / current_close
 
@@ -362,7 +362,7 @@ def create_stock_data_loader(
 
 if __name__ == "__main__":
     headline_file = "data/headline/filtered_headlines_2015_error_removed.csv"
-    stock_data_dir = "data/stock/raw"
+    stock_data_dir = "data/stock/processed"
 
     headline_path = Path(headline_file)
     stock_dir_path = Path(stock_data_dir)
