@@ -91,7 +91,7 @@ class StockHeadlineDataset(Dataset):
         try:
             stock_file = self.stock_data_dir / f"{ticker}_numerical_features_processed.csv"
             data = pd.read_csv(stock_file)
-            data["Date"] = pd.to_datetime(data["Date"])
+            data["Date"] = pd.to_datetime(data["Date"], utc=True)
             data = data.sort_values("Date")
 
             # Add to cache
