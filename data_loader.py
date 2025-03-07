@@ -59,7 +59,7 @@ class StockHeadlineDataset(Dataset):
         # Create a mapping of available stock tickers
         self.available_tickers = set()
         for stock_file in self.stock_data_dir.glob("*.csv"):
-            self.available_tickers.add(stock_file.stem.split('_')[0])
+            self.available_tickers.add(stock_file.stem.split("_")[0])
 
         if self.verbose:
             print(f"Found {len(self.available_tickers)} stock tickers in directory")
@@ -89,7 +89,9 @@ class StockHeadlineDataset(Dataset):
 
         # Load from file
         try:
-            stock_file = self.stock_data_dir / f"{ticker}_numerical_features_processed.csv"
+            stock_file = (
+                self.stock_data_dir / f"{ticker}_numerical_features_processed.csv"
+            )
             data = pd.read_csv(stock_file)
             data["Date"] = pd.to_datetime(data["Date"], utc=True)
             data = data.sort_values("Date")
@@ -290,7 +292,6 @@ def create_stock_data_loader(
     n_samples: int = None,
     batch_size: int = 32,
     shuffle: bool = True,
-    num_workers: int = 4,
     lookback_days: int = 14,
     future_days: int = 1,
     price_movement_threshold: float = 0.005,
@@ -353,9 +354,7 @@ def create_stock_data_loader(
             f"Adjusted batch size from {batch_size} to {actual_batch_size} due to dataset size"
         )
 
-    loader = DataLoader(
-        dataset, batch_size=actual_batch_size, shuffle=shuffle, num_workers=num_workers
-    )
+    loader = DataLoader(dataset, batch_size=actual_batch_size, shuffle=shuffle)
 
     return loader
 
