@@ -59,7 +59,7 @@ class StockHeadlineDataset(Dataset):
         # Create a mapping of available stock tickers
         self.available_tickers = set()
         for stock_file in self.stock_data_dir.glob("*.csv"):
-            self.available_tickers.add(stock_file.stem)
+            self.available_tickers.add(stock_file.stem.split("_")[0])
 
         if self.verbose:
             print(f"Found {len(self.available_tickers)} stock tickers in directory")
@@ -89,9 +89,20 @@ class StockHeadlineDataset(Dataset):
 
         # Load from file
         try:
-            stock_file = self.stock_data_dir / f"{ticker}.csv"
+            stock_file = (
+                self.stock_data_dir / f"{ticker}_numerical_features_processed.csv"
+            )
             data = pd.read_csv(stock_file)
-            data["Date"] = pd.to_datetime(data["Date"])
+            
+            # Drop the "Unnamed: 0" column if it exists (this is usually an index column)
+            if "Unnamed: 0" in data.columns:
+                data = data.drop(columns=["Unnamed: 0"])
+                
+            # Drop the "Capital Gains" column if it exists (has 0.0 values)
+            if "Capital Gains" in data.columns:
+                data = data.drop(columns=["Capital Gains"])
+                
+            data["Date"] = pd.to_datetime(data["Date"], utc=True)
             data = data.sort_values("Date")
 
             # Add to cache
@@ -256,12 +267,12 @@ class StockHeadlineDataset(Dataset):
         ]
 
         # Extract features for the lookback period
-        features = historical_data[["Open", "High", "Low", "Close", "Volume"]].values
+        features = historical_data.drop(columns=["Date"]).values
         features_tensor = torch.tensor(features, dtype=torch.float32).to(self.device)
 
         # Calculate price change for labeling
-        current_close = stock_df.iloc[current_idx]["Close"]
-        future_close = stock_df.iloc[future_day_idx]["Close"]
+        current_close = stock_df.iloc[current_idx]["Log Adjusted Close"]
+        future_close = stock_df.iloc[future_day_idx]["Log Adjusted Close"]
 
         price_change_ratio = (future_close - current_close) / current_close
 
@@ -290,7 +301,6 @@ def create_stock_data_loader(
     n_samples: int = None,
     batch_size: int = 32,
     shuffle: bool = True,
-    num_workers: int = 4,
     lookback_days: int = 14,
     future_days: int = 1,
     price_movement_threshold: float = 0.005,
@@ -353,16 +363,14 @@ def create_stock_data_loader(
             f"Adjusted batch size from {batch_size} to {actual_batch_size} due to dataset size"
         )
 
-    loader = DataLoader(
-        dataset, batch_size=actual_batch_size, shuffle=shuffle, num_workers=num_workers
-    )
+    loader = DataLoader(dataset, batch_size=actual_batch_size, shuffle=shuffle)
 
     return loader
 
 
 if __name__ == "__main__":
     headline_file = "data/headline/filtered_headlines_2015_error_removed.csv"
-    stock_data_dir = "data/stock/raw"
+    stock_data_dir = "data/stock/processed"
 
     headline_path = Path(headline_file)
     stock_dir_path = Path(stock_data_dir)
