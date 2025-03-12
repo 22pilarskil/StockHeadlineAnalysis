@@ -93,6 +93,15 @@ class StockHeadlineDataset(Dataset):
                 self.stock_data_dir / f"{ticker}_numerical_features_processed.csv"
             )
             data = pd.read_csv(stock_file)
+            
+            # Drop the "Unnamed: 0" column if it exists (this is usually an index column)
+            if "Unnamed: 0" in data.columns:
+                data = data.drop(columns=["Unnamed: 0"])
+                
+            # Drop the "Capital Gains" column if it exists (has 0.0 values)
+            if "Capital Gains" in data.columns:
+                data = data.drop(columns=["Capital Gains"])
+                
             data["Date"] = pd.to_datetime(data["Date"], utc=True)
             data = data.sort_values("Date")
 
