@@ -3,6 +3,7 @@ import torch
 from torch.utils.data import Dataset, DataLoader
 from pathlib import Path
 from collections import OrderedDict
+import csv
 
 
 class StockHeadlineDataset(Dataset):
@@ -261,15 +262,6 @@ class StockHeadlineDataset(Dataset):
         # Load stock data on demand
         stock_df = self._load_stock_data(ticker)
 
-        # Get historical data (lookback period)
-        historical_data = stock_df.iloc[
-            current_idx - self.lookback_days : current_idx + 1
-        ]
-
-        # Extract features for the lookback period
-        features = historical_data.drop(columns=["Date"]).values
-        features_tensor = torch.tensor(features, dtype=torch.float32).to(self.device)
-
         # Calculate price change for labeling
         current_close = stock_df.iloc[current_idx]["Log Adjusted Close"]
         future_close = stock_df.iloc[future_day_idx]["Log Adjusted Close"]
@@ -278,20 +270,26 @@ class StockHeadlineDataset(Dataset):
 
         # Assign label based on price movement rules using the threshold parameter
         if price_change_ratio > self.price_movement_threshold:
-            label = 2  # Increase
+            # Increase
+            up = 1
+            stay = 0
+            down = 0
         elif price_change_ratio < -self.price_movement_threshold:
-            label = 0  # Decrease
+            # Decrease
+            up = 0
+            stay = 0
+            down = 1
         else:
-            label = 1  # Stayed the same
+            # Stayed the same
+            up = 0
+            stay = 1
+            down = 0
 
         return {
             "headline": headline_text,
-            "ticker": ticker,
-            "features": features_tensor,
-            "label": torch.tensor(label, dtype=torch.int8).to(self.device),
-            "price_change_ratio": torch.tensor(
-                price_change_ratio, dtype=torch.float32
-            ).to(self.device),
+            "up": torch.tensor(up, dtype=torch.int8).to(self.device),
+            "stay": torch.tensor(stay, dtype=torch.int8).to(self.device),
+            "down": torch.tensor(down, dtype=torch.int8).to(self.device),
         }
 
 
@@ -404,11 +402,28 @@ if __name__ == "__main__":
 
         # Display one batch
         for batch in loader:
-            print(f"Batch size: {len(batch['label'])}")
-            print(f"Features shape: {batch['features'].shape}")
-            print(f"Labels: {batch['label']}")
             print(f"Sample headline: {batch['headline'][0]}")
-            print(f"Sample ticker: {batch['ticker'][0]}")
+            print(f"Sample up trend: {batch['up'][0]}")
+            print(f"Sample stay trend: {batch['stay'][0]}")
+            print(f"Sample down trend: {batch['down'][0]}")
             break
+        
+        # write headlines and corresponding labels to a csv file
+        with open("headlines_labels.csv", "w", newline="", encoding="utf-8") as f:
+            writer = None
+            for batch in loader:
+                if writer is None:
+                    fieldnames = list(batch.keys())
+                    writer = csv.DictWriter(f, fieldnames=fieldnames)
+                    writer.writeheader()
+                batch_size = len(next(iter(batch.values())))
+                for i in range(batch_size):
+                    row_dict = {}
+                    for key in batch:
+                        val = batch[key][i]
+                        if isinstance(val, torch.Tensor):
+                            val = val.item()
+                        row_dict[key] = val
+                    writer.writerow(row_dict)
     except Exception as e:
         print(f"Error creating DataLoader: {str(e)}")
