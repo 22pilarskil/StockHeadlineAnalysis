@@ -13,7 +13,7 @@ class StockHeadlineDataset(Dataset):
         n_samples: int = None,
         lookback_days: int = 14,
         future_days: int = 1,
-        price_movement_threshold: float = 0.005,
+        price_movement_threshold: float = torch.log(torch.tensor(1.05)).item(),
         cache_size: int = 50,
         chunk_size: int = 10000,
         device=None,
@@ -274,7 +274,8 @@ class StockHeadlineDataset(Dataset):
         current_close = stock_df.iloc[current_idx]["Log Adjusted Close"]
         future_close = stock_df.iloc[future_day_idx]["Log Adjusted Close"]
 
-        price_change_ratio = (future_close - current_close) / current_close
+        # Use log difference for symmetric price change ratio
+        price_change_ratio = torch.tensor(future_close - current_close, dtype=torch.float32)
 
         # Assign label based on price movement rules using the threshold parameter
         if price_change_ratio > self.price_movement_threshold:
@@ -303,7 +304,7 @@ def create_stock_data_loader(
     shuffle: bool = True,
     lookback_days: int = 14,
     future_days: int = 1,
-    price_movement_threshold: float = 0.005,
+    price_movement_threshold: float = torch.log(torch.tensor(1.05)).item(),
     cache_size: int = 50,
     chunk_size: int = 10000,
     device=None,
@@ -388,6 +389,9 @@ if __name__ == "__main__":
         print(f"Stock directory contains {len(stock_files)} CSV files")
 
     try:
+        # Convert percent (%) threshold to natural log scale: ex: log(1.05) ≈ 0.05
+        log_threshold = torch.log(torch.tensor(1.05)).item()
+        
         loader = create_stock_data_loader(
             headline_file=headline_file,
             stock_data_dir=stock_data_dir,
@@ -395,7 +399,7 @@ if __name__ == "__main__":
             batch_size=16,
             lookback_days=14,
             future_days=1,
-            price_movement_threshold=0.005,
+            price_movement_threshold=log_threshold,
             cache_size=50,  # Keep n most recent stock dataframes in memory
             chunk_size=10000,  # Use None for all headlines
             device="cuda" if torch.cuda.is_available() else "cpu",
