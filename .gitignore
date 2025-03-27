@@ -1,3 +1,11 @@
+data/
+valid_samples.pkl
+feature_scalers.pkl
+*.out
+*.err
+*.png
+*.txt
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
