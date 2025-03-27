@@ -93,15 +93,15 @@ class StockHeadlineDataset(Dataset):
                 self.stock_data_dir / f"{ticker}_numerical_features_processed.csv"
             )
             data = pd.read_csv(stock_file)
-            
+
             # Drop the "Unnamed: 0" column if it exists (this is usually an index column)
             if "Unnamed: 0" in data.columns:
                 data = data.drop(columns=["Unnamed: 0"])
-                
+
             # Drop the "Capital Gains" column if it exists (has 0.0 values)
             if "Capital Gains" in data.columns:
                 data = data.drop(columns=["Capital Gains"])
-                
+
             data["Date"] = pd.to_datetime(data["Date"], utc=True)
             data = data.sort_values("Date")
 
@@ -275,7 +275,9 @@ class StockHeadlineDataset(Dataset):
         future_close = stock_df.iloc[future_day_idx]["Log Adjusted Close"]
 
         # Use log difference for symmetric price change ratio
-        price_change_ratio = torch.tensor(future_close - current_close, dtype=torch.float32)
+        price_change_ratio = torch.tensor(
+            future_close - current_close, dtype=torch.float32
+        ).to(self.device)
 
         # Assign label based on price movement rules using the threshold parameter
         if price_change_ratio > self.price_movement_threshold:
@@ -290,9 +292,7 @@ class StockHeadlineDataset(Dataset):
             "ticker": ticker,
             "features": features_tensor,
             "label": torch.tensor(label, dtype=torch.int8).to(self.device),
-            "price_change_ratio": torch.tensor(
-                price_change_ratio, dtype=torch.float32
-            ).to(self.device),
+            "price_change_ratio": price_change_ratio,
         }
 
 
@@ -391,7 +391,7 @@ if __name__ == "__main__":
     try:
         # Convert percent (%) threshold to natural log scale: ex: log(1.05) ≈ 0.05
         log_threshold = torch.log(torch.tensor(1.05)).item()
-        
+
         loader = create_stock_data_loader(
             headline_file=headline_file,
             stock_data_dir=stock_data_dir,
