@@ -1,8 +1,11 @@
 import pandas as pd
 import torch
 from torch.utils.data import Dataset, DataLoader
+from transformers import BertTokenizer
 from pathlib import Path
 from collections import OrderedDict
+import pickle
+import numpy as np
 
 
 class StockHeadlineDataset(Dataset):
@@ -10,14 +13,15 @@ class StockHeadlineDataset(Dataset):
         self,
         headline_file: str,
         stock_data_dir: str,
+        tokenizer,
         n_samples: int = None,
         lookback_days: int = 14,
         future_days: int = 1,
-        price_movement_threshold: float = 0.005,
         cache_size: int = 50,
         chunk_size: int = 10000,
         device=None,
         verbose: bool = False,
+        find_valid_samples: bool = True
     ):
         """
         Dataset for stock headlines and corresponding stock data
@@ -28,7 +32,6 @@ class StockHeadlineDataset(Dataset):
             n_samples (int, optional): Number of headline samples to use. If None, use all.
             lookback_days (int): Number of days to look back for stock features
             future_days (int): Number of days to look forward for price change calculation
-            price_movement_threshold (float): Threshold for determining price movement direction
             cache_size (int): Maximum number of stock dataframes to keep in memory
             chunk_size (int): Number of headlines to process at once. If None, process all at once.
             device: Device to place tensors on ('cuda' or 'cpu')
@@ -37,9 +40,13 @@ class StockHeadlineDataset(Dataset):
         # Store parameters but don't load all headlines at once
         self.headline_file = headline_file
         self.stock_data_dir = Path(stock_data_dir)
+        self.tokenizer = tokenizer
         self.n_samples = n_samples
         self.chunk_size = chunk_size
         self.verbose = verbose
+        
+        with open("feature_scalers.pkl", "rb") as f:
+            self.scalers = pickle.load(f)
 
         # Get the total number of rows in the headline file
         with open(headline_file, "rb") as f:
@@ -50,7 +57,6 @@ class StockHeadlineDataset(Dataset):
 
         self.lookback_days = lookback_days
         self.future_days = future_days
-        self.price_movement_threshold = price_movement_threshold
 
         # Create a cache for stock data with limited size
         self.cache_size = cache_size
@@ -76,7 +82,12 @@ class StockHeadlineDataset(Dataset):
         # Store headline data only for valid samples
         self.headline_data = {}  # Dictionary to store headline data for valid samples
         self.valid_samples = []
-        self._find_valid_samples()
+        
+        if (find_valid_samples):
+            self._find_valid_samples()
+        else:
+            with open('valid_samples.pkl', 'rb') as f:
+                self.valid_samples, self.headline_data = pickle.load(f)
 
     def _load_stock_data(self, ticker: str) -> pd.DataFrame:
         """Load stock data for a specific ticker with LRU caching"""
@@ -245,6 +256,10 @@ class StockHeadlineDataset(Dataset):
             print(f"Insufficient history: {insufficient_history}")
             print(f"Insufficient future data: {insufficient_future}")
             print(f"Valid samples found: {len(self.valid_samples)}")
+        
+        with open('valid_samples.pkl', 'wb') as f:
+            pickle.dump((self.valid_samples, self.headline_data), f)
+        
 
     def __len__(self):
         """Return the number of valid samples"""
@@ -257,6 +272,13 @@ class StockHeadlineDataset(Dataset):
         # Get headline information from stored valid headline data
         headline_row = self.headline_data[headline_idx]
         headline_text: str = headline_row["Article_title"]
+        encoded_text = self.tokenizer(
+            headline_text,
+            max_length=128,
+            padding='max_length',
+            truncation=True,
+            return_tensors="pt"
+        )
 
         # Load stock data on demand
         stock_df = self._load_stock_data(ticker)
@@ -266,48 +288,60 @@ class StockHeadlineDataset(Dataset):
             current_idx - self.lookback_days : current_idx + 1
         ]
 
-        # Extract features for the lookback period
-        features = historical_data.drop(columns=["Date"]).values
+
+        selected_columns = [
+            'Volatility', 'RSI', 'P/E Ratio', '% Change Adj Close', '% Change Open',
+            '% Change Volume', '% Change Volatility', '% Change RSI', 'Log Open',
+            'Log Adjusted Close', 'Log Volume'
+        ]
+
+        scaled_features = []
+        unscaled_features = []
+
+        for column in selected_columns:
+            scaler = self.scalers[column]
+            feature = historical_data[column].values.reshape(-1, 1)
+            scaled_feature = scaler.transform(feature)
+            clipped_feature = np.clip(scaled_feature, -3, 3)
+            scaled_features.append(clipped_feature)
+            unscaled_features.append(feature)
+
+        features = np.hstack(scaled_features)
+        unscaled_features = np.hstack(unscaled_features)
+
         features_tensor = torch.tensor(features, dtype=torch.float32).to(self.device)
 
         # Calculate price change for labeling
-        current_close = stock_df.iloc[current_idx]["Log Adjusted Close"]
-        future_close = stock_df.iloc[future_day_idx]["Log Adjusted Close"]
+        current_close = np.exp(stock_df.iloc[current_idx]["Log Adjusted Close"])
+        future_close = np.exp(stock_df.iloc[future_day_idx]["Log Adjusted Close"])
 
-        price_change_ratio = (future_close - current_close) / current_close
-
-        # Assign label based on price movement rules using the threshold parameter
-        if price_change_ratio > self.price_movement_threshold:
-            label = 2  # Increase
-        elif price_change_ratio < -self.price_movement_threshold:
-            label = 0  # Decrease
-        else:
-            label = 1  # Stayed the same
+        price_change = (future_close - current_close) / current_close
 
         return {
-            "headline": headline_text,
+            "headline_input_ids": encoded_text['input_ids'].squeeze(0),
+            "headline_attention_mask": encoded_text['attention_mask'].squeeze(0),
             "ticker": ticker,
             "features": features_tensor,
-            "label": torch.tensor(label, dtype=torch.int8).to(self.device),
-            "price_change_ratio": torch.tensor(
-                price_change_ratio, dtype=torch.float32
-            ).to(self.device),
+            "label": price_change,
+            # "unscaled": unscaled_features
         }
+
 
 
 def create_stock_data_loader(
     headline_file: str,
     stock_data_dir: str,
+    tokenizer,
     n_samples: int = None,
     batch_size: int = 32,
     shuffle: bool = True,
     lookback_days: int = 14,
     future_days: int = 1,
-    price_movement_threshold: float = 0.005,
     cache_size: int = 50,
     chunk_size: int = 10000,
     device=None,
     verbose: bool = False,
+    find_valid_samples: bool = True
 ) -> DataLoader:
     """
     Creates a DataLoader for stock headline data
@@ -321,7 +355,6 @@ def create_stock_data_loader(
         num_workers (int): Number of workers for the DataLoader
         lookback_days (int): Number of days to look back for stock features
         future_days (int): Number of days to look forward for price change calculation
-        price_movement_threshold (float): Threshold for determining price movement direction
         cache_size (int): Maximum number of stock dataframes to keep in memory
         chunk_size (int): Number of headlines to process at once
         device: Device to place tensors on ('cuda' or 'cpu')
@@ -333,14 +366,15 @@ def create_stock_data_loader(
     dataset = StockHeadlineDataset(
         headline_file=headline_file,
         stock_data_dir=stock_data_dir,
+        tokenizer=tokenizer,
         n_samples=n_samples,
         lookback_days=lookback_days,
         future_days=future_days,
-        price_movement_threshold=price_movement_threshold,
         cache_size=cache_size,
         chunk_size=chunk_size,
         device=device,
         verbose=verbose,  # Pass verbose parameter to dataset
+        find_valid_samples=find_valid_samples
     )
 
     valid_samples = len(dataset)
@@ -387,28 +421,30 @@ if __name__ == "__main__":
         stock_files = list(stock_dir_path.glob("*.csv"))
         print(f"Stock directory contains {len(stock_files)} CSV files")
 
-    try:
-        loader = create_stock_data_loader(
-            headline_file=headline_file,
-            stock_data_dir=stock_data_dir,
-            n_samples=None,  # Use None for all headlines
-            batch_size=16,
-            lookback_days=14,
-            future_days=1,
-            price_movement_threshold=0.005,
-            cache_size=50,  # Keep n most recent stock dataframes in memory
-            chunk_size=10000,  # Use None for all headlines
-            device="cuda" if torch.cuda.is_available() else "cpu",
-            verbose=True,
-        )
+    tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
 
-        # Display one batch
-        for batch in loader:
-            print(f"Batch size: {len(batch['label'])}")
-            print(f"Features shape: {batch['features'].shape}")
-            print(f"Labels: {batch['label']}")
-            print(f"Sample headline: {batch['headline'][0]}")
-            print(f"Sample ticker: {batch['ticker'][0]}")
-            break
-    except Exception as e:
-        print(f"Error creating DataLoader: {str(e)}")
+
+    loader = create_stock_data_loader(
+        headline_file=headline_file,
+        stock_data_dir=stock_data_dir,
+        tokenizer=tokenizer,
+        n_samples=None,  # Use None for all headlines
+        batch_size=1,
+        lookback_days=14,
+        future_days=1,
+        cache_size=50,  # Keep n most recent stock dataframes in memory
+        chunk_size=10000,  # Use None for all headlines
+        device="cuda" if torch.cuda.is_available() else "cpu",
+        verbose=True,
+        find_valid_samples=False
+    )
+
+    # Display one batch
+    for batch in loader:
+        print(batch)
+        print(f"Batch size: {len(batch['label'])}")
+        print(f"Features shape: {batch['features'].shape}")
+        print(f"Labels: {batch['label']}")
+        print(f"Sample headline: {batch['headline'][0]}")
+        print(f"Sample ticker: {batch['ticker'][0]}")
+        break
